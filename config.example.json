@@ -1,0 +1,12 @@
+{
+  "mug_address": "YOUR-MUG-MAC-ADDRESS-HERE",
+  "update_interval_seconds": 3,
+  "led_maintain_interval_seconds": 5,
+  "default_temp_presets": {
+    "cold": 120,
+    "warm": 130,
+    "hot": 140,
+    "very_hot": 145,
+    "max": 150
+  }
+}
