@@ -170,6 +170,8 @@ macOS will ask once for Bluetooth access on behalf of Python. If you denied it: 
 
 Ember Mug 2 (14 oz), firmware 406, hardware 10. The GATT layout is the same across Ember's mugs, cups, tumblers and travel mugs per python-ember-mug, but the drink-log decoder has only been validated against this mug. If yours differs, `--stats` captures raw packets to `stats-capture.jsonl`; an issue with that file attached is the fastest way to get it supported.
 
-## License
+## License and disclaimer
 
 MIT — see `LICENSE`.
+
+This is an independent project. It is not affiliated with, endorsed by, or supported by Ember Technologies, Inc. "Ember" is their trademark and is used here only to say which mugs the app works with. The app talks to the mug over the same Bluetooth interface any paired device uses; it does not modify the mug, its firmware, or its settings beyond the temperature, LED, name and unit controls the mug exposes.
