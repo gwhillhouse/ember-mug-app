@@ -1333,6 +1333,7 @@ def run_app() -> None:
                 await mug.update_all()
                 await self._read_battery_extras()
                 await self._subscribe_statistics(mug)
+                await self._set_mug_clock(mug)
                 self._last_liquid_state = mug.data.liquid_state
                 await self._apply_saved_led()
                 if self.config["sync_unit_to_mug"]:
@@ -1376,6 +1377,23 @@ def run_app() -> None:
             self.mug = None
             log.info("Session ended")
             self._render_later()
+
+        async def _set_mug_clock(self, mug: EmberMug) -> None:
+            """Give the mug the time (fc540006: uint32 LE Unix time + int8 UTC offset in hours), as the Ember app does
+            on every connect. Reading the characteristic only returns what was written, but once set, the mug's
+            on-device drink log stamps every record with absolute time instead of seconds-since-pour (see
+            docs/statistics-stream.md)."""
+            client = getattr(mug, "_client", None)
+            if client is None or not client.is_connected:
+                return
+            try:
+                now = int(time.time())
+                offset_h = int(round((datetime.now() - datetime.utcnow()).total_seconds() / 3600))
+                payload = now.to_bytes(4, "little") + (offset_h & 0xFF).to_bytes(1, "big")
+                await client.write_gatt_char(str(MugCharacteristic.DATE_TIME_AND_ZONE.uuid), payload, response=True)
+                log.info("Set mug clock to %d (UTC%+d)", now, offset_h)
+            except Exception as e:  # noqa: BLE001
+                log.warning("Could not set the mug clock: %s", e)
 
         async def _subscribe_statistics(self, mug: EmberMug) -> None:
             """Listen to the undocumented 'statistics' characteristic (fc540013) and log every packet
@@ -1434,6 +1452,41 @@ def run_app() -> None:
                 temp = int.from_bytes(raw[2:4], "little") / 100
                 self.battery_temp_c = temp if 0 < temp < 100 else None
             log.debug("battery raw: %s", raw.hex(" "))
+
+        async def _probe(self, command: dict[str, Any]) -> None:
+            """Research helpers (--probe): raw reads, the clock write, and the control register. Logged, not shown."""
+            client = getattr(self.mug, "_client", None)
+            if client is None or not client.is_connected:
+                log.warning("probe: not connected")
+                return
+            base = "fc54{}-236c-4c94-8fa9-944a3e5353fa"
+            op = command.get("op")
+            if op == "read":
+                uuid = base.format(command["char"])
+                raw = bytes(await client.read_gatt_char(uuid))
+                log.info("probe read %s: %s (%d bytes)", command["char"], raw.hex(" "), len(raw))
+            elif op == "set_clock":
+                now = int(time.time())
+                offset_h = int(round((datetime.now() - datetime.utcnow()).total_seconds() / 3600))
+                payload = now.to_bytes(4, "little") + (offset_h & 0xFF).to_bytes(1, "big")
+                before = bytes(await client.read_gatt_char(base.format("0006")))
+                await client.write_gatt_char(base.format("0006"), payload, response=True)
+                after = bytes(await client.read_gatt_char(base.format("0006")))
+                log.info("probe set_clock: wrote %s (t=%d, tz=%+d) — before %s, after %s", payload.hex(" "), now, offset_h, before.hex(" "), after.hex(" "))
+            elif op == "register":
+                addr = int(command["addr"])
+                addr_uuid, data_uuid = base.format("0010"), base.format("0011")
+                before = bytes(await client.read_gatt_char(addr_uuid))
+                await client.write_gatt_char(addr_uuid, bytes([addr]), response=True)
+                sel = bytes(await client.read_gatt_char(addr_uuid))
+                try:
+                    data = bytes(await client.read_gatt_char(data_uuid))
+                    log.info("probe register %d: address reads %s, data %s (%d bytes)", addr, sel.hex(" "), data.hex(" "), len(data))
+                except Exception as e:  # noqa: BLE001
+                    log.info("probe register %d: address reads %s, data read failed: %s", addr, sel.hex(" "), e)
+                await client.write_gatt_char(addr_uuid, before, response=True)
+            else:
+                log.warning("probe: unknown op %s", op)
 
         async def _dump_gatt(self) -> None:
             """Read every service/characteristic/descriptor on the mug and save it as JSON."""
@@ -1530,6 +1583,8 @@ def run_app() -> None:
                     await self._read_battery_extras()
                 elif cmd == "dump_gatt":
                     await self._dump_gatt()
+                elif cmd == "probe":
+                    await self._probe(command)
                 elif cmd == "stats_resync":
                     client = getattr(self.mug, "_client", None)
                     if client is not None:
@@ -1821,6 +1876,7 @@ def cli(argv: list[str]) -> int:
     parser.add_argument("--dump-gatt", action="store_true", help="read every Bluetooth characteristic on the mug into gatt.json (for the curious)")
     parser.add_argument("--stats", action="store_true", help="show the captured packets from the undocumented statistics characteristic")
     parser.add_argument("--stats-resync", action="store_true", help="unsubscribe/resubscribe to the statistics characteristic (triggers the mug's log flush)")
+    parser.add_argument("--probe", metavar="OP", help=argparse.SUPPRESS)  # research: set-clock | read:0006 | reg:N
     parser.add_argument("--drink-report", action="store_true", help="decode the captured drink log into an HTML report and open it")
     args = parser.parse_args(argv)
 
@@ -1836,7 +1892,7 @@ def cli(argv: list[str]) -> int:
             subprocess.Popen(["open", str(out)])
         return rc
 
-    if not any([args.status, args.set_temp, args.heating_off, args.led, args.refresh, args.setup, args.panel, args.handoff is not None, args.takeback, args.dump_gatt, args.stats_resync]):
+    if not any([args.status, args.set_temp, args.heating_off, args.led, args.refresh, args.setup, args.panel, args.handoff is not None, args.takeback, args.dump_gatt, args.stats_resync, args.probe]):
         run_app()
         return 0
 
@@ -1918,6 +1974,19 @@ def cli(argv: list[str]) -> int:
     if args.refresh:
         write_command({"cmd": "refresh"})
         print("Requested refresh")
+    if args.probe:
+        op, _, arg = args.probe.partition(":")
+        if op == "set-clock":
+            write_command({"cmd": "probe", "op": "set_clock"})
+        elif op == "read":
+            write_command({"cmd": "probe", "op": "read", "char": arg})
+        elif op == "reg":
+            write_command({"cmd": "probe", "op": "register", "addr": int(arg)})
+        else:
+            print(f"unknown probe {args.probe}", file=sys.stderr)
+            return 2
+        print(f"Probe queued: {args.probe} (see the log)")
+        return 0
     if args.stats_resync:
         write_command({"cmd": "stats_resync"})
         print("Requested statistics re-subscribe")

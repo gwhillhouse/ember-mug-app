@@ -35,6 +35,7 @@ DAILY_PATH = SUPPORT_DIR / "daily.json"
 
 LIQUID_STATES = {0: "Standby", 1: "Empty", 2: "Filling", 3: "Cold", 4: "Cooling", 5: "Heating", 6: "At target", 7: "Warm"}
 LIVE_LATENCY_S = 15  # live records arrive ~15-20 s after the event they describe
+EPOCH_MIN = 1_000_000_000  # a record t above this is an absolute Unix time: the mug has been given a clock (fc540006)
 NULL16 = 0x7FFF
 MUG_CAPACITY_ML = 414  # 14 oz Mug 2; level is 0-30
 CUP_MIN_LEVEL = 8  # below ~25 % full it was a rinse, not a drink
@@ -55,6 +56,7 @@ class Record:
     arrived: float
     burst: bool = False  # part of a backlog flush rather than a live event
     raw_packets: list[str] = field(default_factory=list)
+    t_abs: Optional[int] = None  # the mug's own Unix timestamp for this record, when it has a clock; t is then relative to the drink
 
     @property
     def name(self) -> str:
@@ -103,11 +105,11 @@ class Record:
         return f"unknown {f}"
 
     def to_json(self) -> dict[str, Any]:
-        return {"kind": self.kind, "sub": self.sub, "t": self.t, "payload": self.payload.hex(), "arrived": self.arrived, "burst": self.burst, "raw": self.raw_packets}
+        return {"kind": self.kind, "sub": self.sub, "t": self.t, "t_abs": self.t_abs, "payload": self.payload.hex(), "arrived": self.arrived, "burst": self.burst, "raw": self.raw_packets}
 
     @classmethod
     def from_json(cls, d: dict[str, Any]) -> "Record":
-        return cls(d["kind"], d["sub"], d["t"], bytes.fromhex(d["payload"]), d["arrived"], d.get("burst", False), d.get("raw", []))
+        return cls(d["kind"], d["sub"], d["t"], bytes.fromhex(d["payload"]), d["arrived"], d.get("burst", False), d.get("raw", []), d.get("t_abs"))
 
 
 class Reassembler:
@@ -161,26 +163,41 @@ def reassemble_rows(rows: list[dict[str, Any]]) -> list[Record]:
 
 
 def starts_new_drink(r: Record, last_t: int) -> bool:
-    return (r.kind == 0x05 and r.sub == 2 and r.t < 60) or (last_t >= 0 and r.t < last_t - 30)
+    """A 'filling' state record starts a drink. Without a clock the mug's counter restarts at each pour
+    (so t < 60, or t running backwards, means a new drink); with a clock every t is absolute."""
+    if r.t > EPOCH_MIN:
+        return r.kind == 0x05 and r.sub == 2
+    return (r.kind == 0x05 and r.sub == 2 and r.t < 60) or (0 <= last_t < EPOCH_MIN and r.t < last_t - 30)
 
 
 @dataclass
 class Drink:
     records: list[Record] = field(default_factory=list)
     t0: Optional[float] = None  # epoch of the pour
-    anchor_source: str = "none"  # "app" (saw the pour), "live" (live record latency), "none"
+    anchor_source: str = "none"  # "app" (saw the pour), "clock" (the mug's own timestamps), "live" (record latency), "none"
+    clock_base: Optional[int] = None  # mug-clock epoch that this drink's relative t values count from
     ended_at: Optional[float] = None
     end_reason: str = ""
     finished: bool = False
 
     # ---- building ----
     def add(self, r: Record) -> None:
+        if r.t > EPOCH_MIN and r.t_abs is None:
+            if self.clock_base is None:
+                # first stamped record: the pour itself, unless the clock was set mid-drink, in which case keep t continuous
+                self.clock_base = r.t if not self.records else r.t - (self.last_t + LIVE_LATENCY_S)
+            r.t_abs, r.t = r.t, r.t - self.clock_base
         self.records.append(r)
 
     def reanchor(self, arrivals: list[float]) -> None:
         """Classify records as backlog-flush vs live from packet timing, then anchor t0 from a live one.
         Done lazily because the first packets of a flush look 'live' until the rest arrive."""
         if self.anchor_source == "app":
+            return
+        if self.clock_base is not None:
+            self.t0, self.anchor_source = float(self.clock_base), "clock"
+            for r in self.records:
+                r.burst = sum(1 for ts in arrivals if abs(ts - r.arrived) <= 3) >= 4
             return
         live: list[Record] = []
         for r in self.records:

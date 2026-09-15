@@ -33,7 +33,9 @@ Reassembled payloads all start the same way:
 
 - `kind`: record type (below).
 - `sub`: for kind `05` it is the new liquid state; for the other kinds it is constant per kind (looks like a field-layout id).
-- `t`: **uint32 big-endian seconds since the drink was poured** (confirmed: the counter reset to 3 at the fill event and the live record for a target write at 13:12:03 read 7474 → t₀ = 11:07:29).
+- `t`: **uint32 big-endian time**. What it counts depends on whether the mug has been given a clock:
+  - **No clock set** (`fc540006` reads `00 00 00 00 ff`, i.e. the phone app has never touched it, or the mug was reset): seconds since the drink was poured. Confirmed: the counter reset to 3 at the fill event, and the live record for a target write at 13:12:03 read 7474 → t₀ = 11:07:29.
+  - **Clock set**: absolute Unix time. Writing `fc540006` (uint32 little-endian Unix time + int8 UTC offset in hours, the format the phone app uses) makes every subsequent record carry a real timestamp; confirmed 2026-09-15 17:35, when two target writes at 17:36:26 and 17:36:52 produced records stamped `6a a9 c8 74` / `6a a9 c8 8e` (1789511796 / 1789511822), about 10 s after the writes, the same lag the relative records showed. Reading `fc540006` back only returns what was written (it does not tick), but the mug clearly keeps time internally from that point. The app now sets the clock on every connect, so backlog drinks poured while the Mac was away carry exact pour times instead of being anchored from packet arrival. `drinklog.py` handles both: a `t` above 10⁹ is absolute (`t_abs`), and the drink's relative `t` is derived from its first record.
 - All multi-byte numbers are **big-endian** (the GATT characteristics themselves are little-endian, so this log is written by a different code path). Temperatures are °C × 100. `7f ff` / `7f ff ff ff` are "no value" sentinels (INT16_MAX / INT32_MAX); trailing `ff` bytes are padding.
 
 ## Record kinds
@@ -66,12 +68,17 @@ Reassembled payloads all start the same way:
 
 Every heater-engaged record lands ~12 s before the app's log line for the same event, which is the app's notification latency, not the mug's.
 
+## Control register (`fc540010` / `fc540011`)
+
+Read at rest: address `00`, data empty (0 bytes). `fc540011` carries a 20-byte descriptor (`0x2908`, nominally "Report Reference") reading `92 00 ff d6 12 00 7f a8 00 00 fe ec c0 89 f3 ee df f7 80 00`, which looks like uninitialised memory rather than a value. python-ember-mug reads the data register (without selecting an address) as "battery voltage". Not probed further yet; the register is where the temperature lock lives, so writes need care.
+
 ## Open questions
 
 - Whether the `15` snapshot's A/B really are battery percent and temperature. If so, the mug's own log said **41 %** at 11:07 while the battery characteristic has read a flat **6 %** since 11:13 — which would point at a confused fuel gauge (46 °C cell) rather than an empty battery. A second drink's snapshot will settle it.
 - Why the `05` state records only appear at the start of a drink.
 - What `01 58 00 93` is.
-- Whether the Ember app acknowledges/clears the log explicitly (the control register `fc540010/11` is the obvious candidate) or whether the mug simply forgets what it has sent. We have not written to the control register.
+- Whether the Ember app acknowledges/clears the log explicitly (the control register `fc540010/11` is the obvious candidate) or whether the mug simply forgets what it has sent. We have not written to the control register's data side.
+- Whether the mug's clock survives sleep and for how long it drifts; and whether the ~10 s stamp lag is the mug's clock running ahead or the record being written when the event is processed.
 
 ## Capture setup
 
