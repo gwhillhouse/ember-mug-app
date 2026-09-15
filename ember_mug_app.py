@@ -83,6 +83,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "notify_on_perfect": True,
     "notify_low_battery": True,
     "low_battery_percent": 20,
+    "notify_left_behind": True,   # nudge when a full mug sits at target, untouched, for notify_left_behind_min
+    "notify_left_behind_min": 20,
     "led_colour": None,
     "sync_unit_to_mug": True,
     "auto_schedule": False,
@@ -806,6 +808,9 @@ def run_app() -> None:
             self._stop = threading.Event()
             self._last_liquid_state: Optional[LiquidState] = None
             self._low_battery_notified = False
+            self._left_behind_since: Optional[float] = None   # when the drink was last seen dropping
+            self._left_behind_level: Optional[int] = None
+            self._left_behind_notified = False
             self.history = TemperatureHistory(float(self.config["history_hours"]))
             self.tracker = drinklog.DrinkTracker()
             self.eta_seconds: Optional[float] = None
@@ -865,6 +870,7 @@ def run_app() -> None:
             self.unit_c_item = rumps.MenuItem("Celsius (°C)", callback=lambda _: self.set_unit("C"))
             self.notify_perfect_item = rumps.MenuItem("When drink reaches target", callback=self.toggle_notify_perfect)
             self.notify_battery_item = rumps.MenuItem("Low battery", callback=self.toggle_notify_battery)
+            self.notify_left_behind_item = rumps.MenuItem("Drink left untouched", callback=self.toggle_notify_left_behind)
             self.login_item = rumps.MenuItem("Start at Login", callback=self.toggle_login_item)
             self.handoff_item = rumps.MenuItem("Hand Off to Phone (30 min)", callback=self.toggle_handoff)
 
@@ -881,7 +887,7 @@ def run_app() -> None:
                 rumps.MenuItem("Drink Log…", callback=self.open_drink_log),
                 rumps.separator,
                 ["Units", [self.unit_f_item, self.unit_c_item]],
-                ["Notifications", [self.notify_perfect_item, self.notify_battery_item]],
+                ["Notifications", [self.notify_perfect_item, self.notify_battery_item, self.notify_left_behind_item]],
                 self.login_item,
                 rumps.MenuItem("Set Up Mug…", callback=self.open_setup),
                 rumps.separator,
@@ -941,7 +947,9 @@ def run_app() -> None:
 
         def panel_html(self) -> str:
             rows = self.tracker.all_rows()
-            return drinklog.render_panel_html(rows, self.tracker.daily_summary(rows=rows), self._status_snapshot(), use_f=self.use_f, presets_f=self.config["presets_f"])
+            from datetime import timedelta as _td
+            yesterday = self.tracker.daily_summary(day=datetime.now() - _td(days=1), rows=rows)
+            return drinklog.render_panel_html(rows, self.tracker.daily_summary(rows=rows), self._status_snapshot(), use_f=self.use_f, presets_f=self.config["presets_f"], yesterday=yesterday)
 
         def handle_action_url(self, url: str) -> None:
             path = url[len("embermug://"):].strip("/")
@@ -1074,6 +1082,11 @@ def run_app() -> None:
 
         def toggle_notify_perfect(self, _) -> None:
             self.config["notify_on_perfect"] = not self.config["notify_on_perfect"]
+            save_config(self.config)
+            self._refresh_settings_marks()
+
+        def toggle_notify_left_behind(self, _) -> None:
+            self.config["notify_left_behind"] = not self.config.get("notify_left_behind", True)
             save_config(self.config)
             self._refresh_settings_marks()
 
@@ -1618,10 +1631,35 @@ def run_app() -> None:
                 level=data.liquid_level,
             )
             self._check_charging_health()
+            self._check_left_behind(data)
             if data.liquid_state == LiquidState.HEATING and data.target_temp:
                 self.eta_seconds = self.history.eta_seconds(data.current_temp, data.target_temp)
             else:
                 self.eta_seconds = None
+
+        def _check_left_behind(self, data: MugData) -> None:
+            """Nudge when a full, at-target mug goes untouched: level hasn't dropped for N minutes while ready.
+            Reset when the level falls (you drank), the mug is emptied, or it leaves the target."""
+            if not self.config.get("notify_left_behind", True):
+                return
+            level = data.liquid_level
+            at_target = data.liquid_state == LiquidState.TARGET_TEMPERATURE
+            full_enough = level is not None and level >= drinklog.CUP_MIN_LEVEL
+            if not (at_target and full_enough):
+                self._left_behind_since = None
+                self._left_behind_notified = False
+                return
+            now_ts = time.time()
+            if self._left_behind_level is None or level < self._left_behind_level:
+                # first reading at target, or the level just dropped (a sip): (re)start the clock
+                self._left_behind_level = level
+                self._left_behind_since = now_ts
+                self._left_behind_notified = False
+                return
+            mins = int(self.config.get("notify_left_behind_min", 20))
+            if not self._left_behind_notified and self._left_behind_since and now_ts - self._left_behind_since >= mins * 60:
+                notify(APP_NAME, f"Your coffee's getting lonely — it's been ready and untouched for {mins} min.")
+                self._left_behind_notified = True
 
         def _check_charging_health(self) -> None:
             """Warn once if the mug has sat on the coaster for a while without gaining charge."""
@@ -1819,6 +1857,7 @@ def run_app() -> None:
             self.unit_c_item.state = 0 if self.use_f else 1
             self.notify_perfect_item.state = 1 if self.config["notify_on_perfect"] else 0
             self.notify_battery_item.state = 1 if self.config["notify_low_battery"] else 0
+            self.notify_left_behind_item.state = 1 if self.config.get("notify_left_behind", True) else 0
             self.auto_schedule_item.state = 1 if self.config["auto_schedule"] else 0
             self.login_item.state = 1 if login_item_installed() else 0
 

@@ -447,6 +447,42 @@ class DrinkTracker:
             parts.append(f"poured {s['last_pour'][11:16]}")
         return " · ".join(parts)
 
+    def day_line(self, summary: dict[str, Any], label: str, use_f: bool = True) -> str:
+        """One sentence for a briefing: 'Yesterday: 3 cups · 41 oz · 07:12–15:40 · ~22 min to target · 1 left to go cold'."""
+        s = summary
+        if not s["cups"]:
+            return f"{label}: no cups"
+        parts = [f"{label}: {s['cups']} cup{'s' if s['cups'] != 1 else ''}"]
+        if s["consumed_ml"]:
+            parts.append(f"{s['consumed_ml']} ml" if not use_f else f"{s['consumed_ml'] / 29.57:.0f} oz")
+        if s["first_pour"]:
+            span = s["first_pour"][11:16]
+            if s["last_pour"] and s["last_pour"] != s["first_pour"]:
+                span += f"–{s['last_pour'][11:16]}"
+            parts.append(span)
+        if s["avg_time_to_target_s"]:
+            parts.append(f"~{fmt_dur(s['avg_time_to_target_s'])} to target")
+        if s["abandoned"]:
+            parts.append(f"{s['abandoned']} left to go cold")
+        if s["in_progress"]:
+            parts.append("one in progress")
+        return " · ".join(parts)
+
+    def briefing(self, use_f: bool = True, rows: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
+        """Yesterday and today, as data and as lines, for morning summaries and scripts."""
+        rows = rows if rows is not None else self.all_rows()
+        today = self.daily_summary(rows=rows)
+        yesterday = self.daily_summary(day=datetime.now() - timedelta(days=1), rows=rows)
+        week_rows = [r for r in rows if r["is_cup"] and r.get("poured_ts") and r["poured_ts"] >= datetime.now().timestamp() - 7 * 86400]
+        return {
+            "today": today,
+            "yesterday": yesterday,
+            "today_line": self.day_line(today, "Today", use_f),
+            "yesterday_line": self.day_line(yesterday, "Yesterday", use_f),
+            "week_cups": len(week_rows),
+            "week_ml": sum(r["consumed_ml"] or 0 for r in week_rows),
+        }
+
 
 def drinks_from_capture(rows: list[dict[str, Any]], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rebuild every drink from the raw capture (validation path; ignores drinks.jsonl)."""
@@ -822,13 +858,15 @@ figure { padding: 8px 8px 2px; border-radius: 6px; }
 .recent td, .recent th { padding: 6px 8px; }
 .recent td:first-child { color: var(--ink); }
 .recent td.empty { white-space: normal; color: var(--ink-2); padding: 10px 8px; }
+.yday { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; padding: 10px 14px; }
+.yday .yv { font: 500 12px/1.3 var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; text-align: end; }
 .foot { margin-top: 10px; font-size: 11px; }
 .foot a { color: var(--ink-2); }
 @media (prefers-reduced-motion: reduce) { .actions button { transition: none; } .actions button:active { scale: 1; } }
 """
 
 
-def render_panel_html(rows: list[dict[str, Any]], daily: dict[str, Any], status: dict[str, Any], use_f: bool = True, presets_f: Optional[dict[str, int]] = None) -> str:
+def render_panel_html(rows: list[dict[str, Any]], daily: dict[str, Any], status: dict[str, Any], use_f: bool = True, presets_f: Optional[dict[str, int]] = None, yesterday: Optional[dict[str, Any]] = None) -> str:
     """Compact instrument panel for the menu-bar popover. Actions navigate to embermug:// URLs the app intercepts."""
     unit = "°F" if use_f else "°C"
 
@@ -928,6 +966,23 @@ def render_panel_html(rows: list[dict[str, Any]], daily: dict[str, Any], status:
       <div class="tablewrap"><table class="recent"><thead><tr><th>poured</th><th>lasted</th><th>drank</th><th>ready</th><th>status</th></tr></thead><tbody>{recent_rows or empty}</tbody></table></div>
     </section>"""
 
+    yday = ""
+    if yesterday and yesterday.get("cups"):
+        ml = yesterday["consumed_ml"]
+        vol = f"{ml} ml" if not use_f else f"{ml / 29.57:.0f} oz"
+        span = ""
+        if yesterday.get("first_pour"):
+            span = yesterday["first_pour"][11:16]
+            if yesterday.get("last_pour") and yesterday["last_pour"] != yesterday["first_pour"]:
+                span += "\u2013" + yesterday["last_pour"][11:16]
+        bits = [f"{yesterday['cups']} cup{'s' if yesterday['cups'] != 1 else ''}"]
+        if ml:
+            bits.append(vol)
+        if span:
+            bits.append(span)
+        if yesterday.get("abandoned"):
+            bits.append(f"{yesterday['abandoned']} went cold")
+        yday = '<section class="panel yday" aria-label="Yesterday"><span class="rl">yesterday</span><span class="yv">' + html.escape(" · ".join(bits)) + '</span></section>'
     name = status.get("name")
     mug_line = " · ".join(str(v) for v in (name if name and str(name).strip().upper() != "EMBER" else None, status.get("model")) if v)
     meta = f'<i class="{"live" if connected else ""}" aria-hidden="true"></i>{"connected" if connected else "not connected"}' + (f' · {html.escape(mug_line)}' if mug_line else "")
@@ -941,6 +996,7 @@ def render_panel_html(rows: list[dict[str, Any]], daily: dict[str, Any], status:
   {actions}
   {chart}
   {recent}
+  {yday}
   <p class="foot">Control-click or right-click the menu bar icon for settings.</p>
 </main>
 <script>
@@ -963,6 +1019,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--json", action="store_true", help="print drinks as JSON")
     parser.add_argument("--html", metavar="FILE", help="write the drink-log page")
     parser.add_argument("--celsius", action="store_true", help="report in °C instead of °F")
+    parser.add_argument("--briefing", action="store_true", help="print yesterday's and today's one-line summaries (add --json for the data)")
     parser.add_argument("--from-capture", action="store_true", help="rebuild from the raw capture instead of drinks.jsonl")
     parser.add_argument("--capture", default=str(CAPTURE_PATH))
     args = parser.parse_args(argv)
@@ -990,6 +1047,14 @@ def main(argv: list[str]) -> int:
         packets = 0
     daily = tracker.daily_summary(history=history, rows=rows)
 
+    if args.briefing:
+        b = tracker.briefing(use_f=not args.celsius, rows=rows)
+        if args.json:
+            print(json.dumps(b, indent=2, default=str))
+        else:
+            print(b["yesterday_line"])
+            print(b["today_line"])
+        return 0
     if args.html:
         mug = None
         try:
