@@ -1,0 +1,3 @@
+rumps>=0.4.0
+python-ember-mug>=1.2.1
+pyobjc-framework-WebKit>=10

@@ -1,12 +1,25 @@
 {
-  "mug_address": "YOUR-MUG-MAC-ADDRESS-HERE",
-  "update_interval_seconds": 3,
-  "led_maintain_interval_seconds": 5,
-  "default_temp_presets": {
-    "cold": 120,
-    "warm": 130,
-    "hot": 140,
-    "very_hot": 145,
-    "max": 150
-  }
+  "mug_address": "",
+  "temperature_unit": "F",
+  "menu_icon": "",
+  "presets_f": {
+    "Cold": 120,
+    "Warm": 130,
+    "Hot": 140,
+    "Very Hot": 145
+  },
+  "full_refresh_seconds": 60,
+  "scan_timeout_seconds": 15,
+  "notify_on_perfect": true,
+  "notify_low_battery": true,
+  "low_battery_percent": 20,
+  "led_colour": null,
+  "sync_unit_to_mug": true,
+  "auto_schedule": false,
+  "schedule": [
+    { "label": "Morning",   "start": "05:00", "end": "11:00", "temp_f": 140 },
+    { "label": "Afternoon", "start": "11:00", "end": "17:00", "temp_f": 135 },
+    { "label": "Evening",   "start": "17:00", "end": "23:00", "temp_f": 130 }
+  ],
+  "history_hours": 12
 }

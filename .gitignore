@@ -23,8 +23,19 @@ env/
 .DS_Store
 *.app
 
-# Config
+# Config (holds your mug's address)
 config.json
 
 # Logs
 *.log
+
+# Superseded drafts, captures and screenshots
+archive/
+
+# Cowork session output folder and versioned deploy copies
+Claude outputs/
+*.v[0-9]*.py
+*.v[0-9]*.md
+*.v[0-9]*.sh
+*.v[0-9]*.txt
+*.bak
