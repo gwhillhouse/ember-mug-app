@@ -70,14 +70,24 @@ Every heater-engaged record lands ~12 s before the app's log line for the same e
 
 ## Control register (`fc540010` / `fc540011`)
 
-Read at rest: address `00`, data empty (0 bytes). `fc540011` carries a 20-byte descriptor (`0x2908`, nominally "Report Reference") reading `92 00 ff d6 12 00 7f a8 00 00 fe ec c0 89 f3 ee df f7 80 00`, which looks like uninitialised memory rather than a value. python-ember-mug reads the data register (without selecting an address) as "battery voltage". Not probed further yet; the register is where the temperature lock lives, so writes need care.
+The register pair works as address-select then read: write a byte to `fc540010`, read `fc540011`. Scanned 2026-09-15 (addresses 0–24, 32, 64, 100, 128, 200, 254, 255; only the address side was written, and it was restored to 0 afterwards):
+
+| address | data | meaning |
+|---|---|---|
+| `00` | (empty) | Nothing. This is what python-ember-mug's `get_battery_voltage()` reads, so that attribute is 0 bytes on this firmware. |
+| `01` | `6a d3 17 64 b0 c1` | The mug's Bluetooth MAC, little-endian (the same bytes lead `fc54000d`). |
+| `02` | `98 3e 00 20 34 25 00 20 a5 2f 00 00 34 06 00 20 7f 20 00 00` | Five 32-bit LE words: `0x20003e98`, `0x20002534`, `0x00002fa5`, `0x20000634`, `0x0000207f`. Three are nRF SRAM addresses (SRAM starts at `0x20000000`), so this is a firmware debug view (stack/heap pointers and two counters), not a setting. |
+| `03` | `54 4a 4f 20 3b 2d 29` | ASCII **`TJO ;-)`**. A firmware engineer's initials. Hello, TJO. |
+| `04` and up | `78 56 34 12` | `0x12345678`: the "not implemented" placeholder, identical at every address tried through `ff`. |
+
+`fc540011` also carries a 20-byte `0x2908` descriptor reading `92 00 ff d6 12 00 7f a8 00 00 fe ec c0 89 f3 ee df f7 80 00`, which looks like uninitialised memory. So on firmware 406 the control register is a debug port with a joke in it, not where the temperature lock or a log acknowledgement lives; whatever the phone app does there goes through writes to the data side, which we have not tried.
 
 ## Open questions
 
 - Whether the `15` snapshot's A/B really are battery percent and temperature. If so, the mug's own log said **41 %** at 11:07 while the battery characteristic has read a flat **6 %** since 11:13 — which would point at a confused fuel gauge (46 °C cell) rather than an empty battery. A second drink's snapshot will settle it.
 - Why the `05` state records only appear at the start of a drink.
 - What `01 58 00 93` is.
-- Whether the Ember app acknowledges/clears the log explicitly (the control register `fc540010/11` is the obvious candidate) or whether the mug simply forgets what it has sent. We have not written to the control register's data side.
+- Whether the Ember app acknowledges/clears the log explicitly or the mug simply forgets what it has sent. The control register's readable side is a debug view (above); an acknowledgement would have to be a write to its data side, which we have not tried.
 - Whether the mug's clock survives sleep and for how long it drifts; and whether the ~10 s stamp lag is the mug's clock running ahead or the record being written when the event is processed.
 
 ## Capture setup
