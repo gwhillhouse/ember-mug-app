@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- A pour the app saw was logged as two drinks (an empty one plus the real one) once the mug's own "filling" record arrived, and the real drink lost its exact pour time.
+- Closing the setup window with its close button left the app stuck in "Setup in progress…" until relaunch.
+- A malformed or unreadable CLI command could stop the Bluetooth thread for good; a bad `config.json` was silently replaced with defaults on the next save (it is now kept as `config.json.bad`).
+- Several CLI flags in one call (`--set-temp 140 --led red`) no longer overwrite each other; commands the app can't act on within 60 s are dropped instead of running on the next connect.
+- `--set-temp` rejects values outside the mug's range (it used to turn heating off for `0`/`32F` and set maximum heat for `nan`); `--handoff` takes 1–1440 minutes.
+- The drink tracker and the history deques are locked, since the Bluetooth thread writes them while the menu reads them.
+
+### Changed
+- `config.json`, `drinks.jsonl`, `current-drink.json` and `daily.json` are written atomically; a torn line in `drinks.jsonl` or `history.jsonl` is skipped.
+- `history.jsonl` is compacted to the last 30 days on launch and read incrementally by the drink log (it was re-read in full on every packet and menu refresh).
+- Statistics packets are logged at DEBUG, and log lines are no longer duplicated into the unrotated launcher log.
+
+### Added
+- Unit tests for the drink-log decoder and the app's GUI-free helpers: `python -m unittest discover -s tests`.
+
 ## 2.0.0 — 2026-09-15
 
 A rewrite of the app around push updates, with onboarding, an instrument-panel popover, and the mug's own drink log.

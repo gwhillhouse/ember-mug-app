@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 import logging
+import math
 import os
 import plistlib
 import subprocess
@@ -43,12 +44,17 @@ APP_NAME = "Ember Mug"
 __version__ = "2.0.0"
 BUNDLE_ID = "com.gwhillhouse.ember-mug"
 SCRIPT_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(SCRIPT_DIR))
+import drinklog  # noqa: E402  (no GUI dependencies)
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 LOG_DIR = Path.home() / "Library" / "Logs" / "EmberMug"
 LOG_PATH = LOG_DIR / "ember-mug.log"
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "EmberMug"
 STATUS_PATH = SUPPORT_DIR / "status.json"
-COMMAND_PATH = SUPPORT_DIR / "command.json"
+COMMAND_PATH = SUPPORT_DIR / "command.json"  # legacy single-slot channel, still read
+COMMAND_DIR = SUPPORT_DIR / "commands"  # one file per CLI request
+COMMAND_MAX_AGE_S = 60  # a request the app could not act on in time is dropped, not replayed later
+HISTORY_KEEP_DAYS = 30  # history.jsonl is compacted to this on launch (finished drinks keep their own readings)
 HISTORY_PATH = SUPPORT_DIR / "history.jsonl"
 STATS_CAPTURE_PATH = SUPPORT_DIR / "stats-capture.jsonl"  # raw fc540013 notifications, for reverse engineering
 LAUNCH_AGENT_PATH = Path.home() / "Library" / "LaunchAgents" / f"{BUNDLE_ID}.plist"
@@ -110,12 +116,13 @@ def setup_logging() -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s", "%Y-%m-%d %H:%M:%S")
     handler = RotatingFileHandler(LOG_PATH, maxBytes=1_000_000, backupCount=3)
     handler.setFormatter(fmt)
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(fmt)
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
-    root.addHandler(stream)
+    if sys.stdout.isatty():  # under the launcher/launchd stdout is an unrotated file: the rotating log is enough
+        stream = logging.StreamHandler(sys.stdout)
+        stream.setFormatter(fmt)
+        root.addHandler(stream)
     logging.getLogger("bleak_retry_connector").setLevel(logging.WARNING)
 
 
@@ -125,8 +132,16 @@ def load_config() -> dict[str, Any]:
         try:
             with open(CONFIG_PATH) as f:
                 user = json.load(f)
-        except json.JSONDecodeError as e:
-            log.error("config.json is invalid JSON (%s); using defaults", e)
+            if not isinstance(user, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as e:
+            # Keep the broken file: the next save would otherwise replace the user's settings with defaults.
+            backup = CONFIG_PATH.with_name("config.json.bad")
+            log.error("config.json is unreadable (%s); using defaults, original kept as %s", e, backup.name)
+            try:
+                CONFIG_PATH.replace(backup)
+            except OSError:
+                pass
             user = {}
         config.update({k: v for k, v in user.items() if k in DEFAULT_CONFIG})
         if "default_temp_presets" in user and "presets_f" not in user:  # original config format
@@ -150,13 +165,16 @@ def load_config() -> dict[str, Any]:
     return config
 
 
+_config_lock = threading.Lock()
+
+
 def save_config(config: dict[str, Any]) -> None:
-    try:
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(config, f, indent=2)
-            f.write("\n")
-    except OSError as e:
-        log.warning("Could not save config.json: %s", e)
+    """Saved from both the main and the Bluetooth thread: serialise, and replace the file in one step."""
+    with _config_lock:
+        try:
+            drinklog.write_atomic(CONFIG_PATH, json.dumps(config, indent=2) + "\n")
+        except (OSError, TypeError, ValueError) as e:
+            log.warning("Could not save config.json: %s", e)
 
 
 def c_to_f(temp_c: float) -> float:
@@ -245,11 +263,43 @@ def read_status_file() -> Optional[dict[str, Any]]:
 
 
 def write_command(command: dict[str, Any]) -> None:
-    SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = COMMAND_PATH.with_suffix(".tmp")
-    with open(tmp, "w") as f:
-        json.dump(command, f)
-    tmp.replace(COMMAND_PATH)
+    """Queue a request for the running app: one uniquely named file each, so several never overwrite each other."""
+    name = f"{time.time_ns()}-{os.getpid()}-{command.get('cmd', 'x')}.json"
+    drinklog.write_atomic(COMMAND_DIR / name, json.dumps({**command, "ts": time.time()}))
+
+
+def take_commands() -> list[dict[str, Any]]:
+    """Claim every queued request, oldest first, dropping ones too old to act on. Claiming is a rename, so a
+    request is handled once even if a second reader races us, and one written mid-read is never deleted unread."""
+    paths = sorted(COMMAND_DIR.glob("*.json")) if COMMAND_DIR.is_dir() else []
+    if COMMAND_PATH.exists():
+        paths.insert(0, COMMAND_PATH)
+    out: list[dict[str, Any]] = []
+    for path in paths:
+        claimed = path.with_name(path.name + ".claimed")
+        try:
+            path.rename(claimed)
+        except OSError:
+            continue
+        try:
+            with open(claimed) as f:
+                command = json.load(f)
+        except (OSError, ValueError):
+            command = None
+        finally:
+            try:
+                claimed.unlink()
+            except OSError:
+                pass
+        if not isinstance(command, dict) or not isinstance(command.get("cmd"), str):
+            log.warning("Ignoring malformed CLI command in %s", path.name)
+            continue
+        ts = command.get("ts")
+        if isinstance(ts, (int, float)) and time.time() - ts > COMMAND_MAX_AGE_S:
+            log.warning("Dropping stale CLI command (%.0fs old): %s", time.time() - ts, command)
+            continue
+        out.append(command)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -262,26 +312,47 @@ class TemperatureHistory:
 
     def __init__(self, hours: float) -> None:
         self.window = hours * 3600
+        self.lock = threading.Lock()  # added to on the Bluetooth thread, read by the menu and graph on the main thread
         self.samples: deque[tuple[float, float, Optional[float], str]] = deque()  # (ts, current_c, target_c, state)
         self.battery: deque[tuple[float, float, bool]] = deque()  # (ts, percent, on_base)
         self._last_logged: Optional[tuple[float, Optional[float], str]] = None
         self._load()
 
     def _load(self) -> None:
-        cutoff = time.time() - self.window
+        """Load the recent window, and compact the log to HISTORY_KEEP_DAYS (it is appended to about once a minute)."""
+        now = time.time()
+        cutoff, keep_after = now - self.window, now - HISTORY_KEEP_DAYS * 86400
+        kept: list[str] = []
+        dropped = 0
         try:
             with open(HISTORY_PATH) as f:
                 for line in f:
                     try:
                         row = json.loads(line)
-                    except json.JSONDecodeError:
+                        ts = float(row["ts"])
+                    except (ValueError, TypeError, KeyError):
+                        dropped += 1
                         continue
-                    if row.get("ts", 0) >= cutoff:
-                        self.samples.append((row["ts"], row["current_c"], row.get("target_c"), row.get("state", "")))
-                        if row.get("battery") is not None:
-                            self.battery.append((row["ts"], row["battery"], bool(row.get("on_base"))))
+                    if ts < keep_after:
+                        dropped += 1
+                        continue
+                    kept.append(line if line.endswith("\n") else line + "\n")
+                    if ts >= cutoff and isinstance(row.get("current_c"), (int, float)):
+                        self.samples.append((ts, row["current_c"], row.get("target_c"), row.get("state", "")))
+                        if isinstance(row.get("battery"), (int, float)):
+                            self.battery.append((ts, row["battery"], bool(row.get("on_base"))))
         except OSError:
-            pass
+            return
+        if dropped:
+            try:
+                drinklog.write_atomic(HISTORY_PATH, "".join(kept))
+                log.info("history.jsonl: dropped %d readings older than %d days (or unreadable)", dropped, HISTORY_KEEP_DAYS)
+            except OSError as e:
+                log.warning("Could not compact history.jsonl: %s", e)
+
+    def snapshot(self) -> list[tuple[float, float, Optional[float], str]]:
+        with self.lock:
+            return list(self.samples)
 
     def add(self, current_c: float, target_c: Optional[float], state: str, battery: Optional[float] = None, on_base: bool = False, level: Optional[int] = None) -> None:
         now = time.time()
@@ -290,14 +361,15 @@ class TemperatureHistory:
         if self._last_logged == key and self.samples and now - self.samples[-1][0] < 60:
             return
         self._last_logged = key
-        self.samples.append((now, current_c, target_c, state))
-        if battery is not None:
-            self.battery.append((now, battery, on_base))
-        cutoff = now - self.window
-        while self.samples and self.samples[0][0] < cutoff:
-            self.samples.popleft()
-        while self.battery and self.battery[0][0] < cutoff:
-            self.battery.popleft()
+        with self.lock:
+            self.samples.append((now, current_c, target_c, state))
+            if battery is not None:
+                self.battery.append((now, battery, on_base))
+            cutoff = now - self.window
+            while self.samples and self.samples[0][0] < cutoff:
+                self.samples.popleft()
+            while self.battery and self.battery[0][0] < cutoff:
+                self.battery.popleft()
         try:
             SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
             with open(HISTORY_PATH, "a") as f:
@@ -307,13 +379,15 @@ class TemperatureHistory:
 
     def battery_trend(self) -> Optional[dict[str, Any]]:
         """Charge/drain rate (%/hour) over the current uninterrupted on-base or off-base stretch."""
-        if len(self.battery) < 2:
+        with self.lock:
+            battery = list(self.battery)
+        if len(battery) < 2:
             return None
         now = time.time()
-        latest_ts, latest_pct, on_base = self.battery[-1]
+        latest_ts, latest_pct, on_base = battery[-1]
         # Walk back from the newest sample until the on-base state flips.
         contiguous: list[tuple[float, float]] = []
-        for ts, pct, base in reversed(self.battery):
+        for ts, pct, base in reversed(battery):
             if base != on_base:
                 break
             contiguous.append((ts, pct))
@@ -328,7 +402,7 @@ class TemperatureHistory:
     def eta_seconds(self, current_c: float, target_c: float) -> Optional[float]:
         """Estimate seconds until target using the heating rate over the last few minutes."""
         now = time.time()
-        recent = [(ts, temp) for ts, temp, _, _ in self.samples if now - ts <= 240]
+        recent = [(ts, temp) for ts, temp, _, _ in self.snapshot() if now - ts <= 240]
         if len(recent) < 3 or recent[-1][0] - recent[0][0] < 30:
             return None
         n = len(recent)
@@ -383,9 +457,6 @@ def run_app() -> None:
     from Foundation import NSObject, NSString, NSURL
     from PyObjCTools import AppHelper
     import objc
-
-    sys.path.insert(0, str(SCRIPT_DIR))
-    import drinklog  # noqa: PLC0415
 
     try:
         from AppKit import NSAppearance, NSPopover, NSScreen, NSViewController
@@ -469,6 +540,7 @@ def run_app() -> None:
             )
             self.window.setTitle_("Set Up Ember Mug")
             self.window.setReleasedWhenClosed_(False)
+            self.window.setDelegate_(self)  # windowWillClose_: the title-bar close button must end setup mode too
             self.window.center()
             v = self.window.contentView()
             secondary = NSColor.secondaryLabelColor()
@@ -602,7 +674,9 @@ def run_app() -> None:
             self.status_label.setStringValue_(f"Found {len(found)} mug{'s' if len(found) != 1 else ''} — pick yours below.")
 
         def cancel_(self, sender):
-            self.window.close()
+            self.window.close()  # → windowWillClose_
+
+        def windowWillClose_(self, notification):
             self.app.leave_setup_mode()
 
         def save_(self, sender):
@@ -616,8 +690,7 @@ def run_app() -> None:
             self.app.pending_name = name or None
             save_config(self.app.config)
             log.info("Setup saved: %s", device.address)
-            self.window.close()
-            self.app.leave_setup_mode()
+            self.window.close()  # → windowWillClose_
 
     # ---------------------------------------------------------- history view --
 
@@ -632,7 +705,7 @@ def run_app() -> None:
         def drawRect_(self, rect):
             NSColor.windowBackgroundColor().set()
             NSBezierPath.fillRect_(self.bounds())
-            samples = list(self.app.history.samples)
+            samples = self.app.history.snapshot()
             w, h = self.bounds().size.width, self.bounds().size.height
             left, right, top, bottom = 44, 12, 12, 28
             font = NSFont.systemFontOfSize_(10)
@@ -1436,7 +1509,7 @@ def run_app() -> None:
                 "on_base": d.battery.on_charging_base if d and d.battery else None,
                 "battery_temp_c": self.battery_temp_c,
             }
-            log.info("Statistics packet (%d bytes): %s", len(raw), row["hex"])
+            log.debug("Statistics packet (%d bytes): %s", len(raw), row["hex"])
             try:
                 SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
                 with open(STATS_CAPTURE_PATH, "a") as f:
@@ -1548,24 +1621,26 @@ def run_app() -> None:
                 log.info("Schedule (%s): applied %s → %.1fC", reason, rule.get("label"), target_c)
 
         async def _run_pending_command(self) -> None:
-            """Execute a command written by the CLI (--set-temp etc.)."""
-            if not COMMAND_PATH.exists():
-                return
+            """Execute the commands queued by the CLI (--set-temp etc.). Never raises: a bad request must not
+            end the Bluetooth thread or drop a healthy connection."""
             try:
-                with open(COMMAND_PATH) as f:
-                    command = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                command = None
-            try:
-                COMMAND_PATH.unlink()
-            except OSError:
-                pass
-            if not command:
+                commands = take_commands()
+            except Exception:  # noqa: BLE001
+                log.exception("Reading CLI commands failed")
                 return
+            for command in commands:
+                try:
+                    await self._run_command(command)
+                except Exception:  # noqa: BLE001
+                    log.exception("CLI command failed: %s", command)
+
+        async def _run_command(self, command: dict[str, Any]) -> None:
             cmd = command.get("cmd")
             log.info("CLI command: %s", command)
             if cmd == "handoff":
-                AppHelper.callAfter(self.hand_off, float(command.get("seconds", 1800)))
+                seconds = float(command.get("seconds", 1800))
+                if math.isfinite(seconds) and 0 < seconds <= 86400:
+                    AppHelper.callAfter(self.hand_off, seconds)
                 return
             if cmd == "takeback":
                 AppHelper.callAfter(self.take_back)
@@ -1583,6 +1658,8 @@ def run_app() -> None:
             try:
                 if cmd == "set_temp":
                     temp_c = float(command["temp_c"])
+                    if not math.isfinite(temp_c):
+                        raise ValueError(f"temperature {temp_c}")
                     if temp_c != 0:
                         temp_c = max(MIN_TEMP_C, min(MAX_TEMP_C, temp_c))
                     await self.mug.set_target_temp(temp_c)
@@ -1922,9 +1999,6 @@ def cli(argv: list[str]) -> int:
     if args.stats:
         return show_stats_capture()
     if args.drink_report:
-        sys.path.insert(0, str(SCRIPT_DIR))
-        import drinklog  # noqa: PLC0415
-
         out = SUPPORT_DIR / "drink-log.html"
         rc = drinklog.main(["--html", str(out)] + ([] if load_config()["temperature_unit"] == "F" else ["--celsius"]))
         if rc == 0:
@@ -1964,6 +2038,9 @@ def cli(argv: list[str]) -> int:
         return 0 if status.get("connected") else 1
 
     if args.handoff is not None:
+        if not (math.isfinite(args.handoff) and 0 < args.handoff <= 24 * 60):
+            print("--handoff takes 1 to 1440 minutes", file=sys.stderr)
+            return 2
         write_command({"cmd": "handoff", "seconds": args.handoff * 60})
         print(f"Handing the mug off to your phone for {args.handoff:g} min")
         return 0
@@ -1990,7 +2067,15 @@ def cli(argv: list[str]) -> int:
         unit = config["temperature_unit"]
         if raw.endswith("F") or raw.endswith("C"):
             unit, raw = raw[-1], raw[:-1]
-        value = float(raw)
+        try:
+            value = float(raw)
+        except ValueError:
+            print(f"Not a temperature: {args.set_temp!r}", file=sys.stderr)
+            return 2
+        lo, hi = (MIN_TEMP_F, MAX_TEMP_F) if unit == "F" else (MIN_TEMP_C, MAX_TEMP_C)
+        if not math.isfinite(value) or not lo - 0.5 <= value <= hi + 0.5:
+            print(f"{args.set_temp} is out of range: the mug heats to {lo:g}–{hi:g}°{unit} (use --heating-off to turn it off)", file=sys.stderr)
+            return 2
         temp_c = f_to_c(value) if unit == "F" else value
         write_command({"cmd": "set_temp", "temp_c": temp_c})
         print(f"Requested target {value:g}°{unit}")

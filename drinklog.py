@@ -24,10 +24,25 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Optional
+from functools import wraps
+from typing import Any, Callable, Optional, TypeVar
+
+_F = TypeVar("_F", bound=Callable[..., Any])
+
+
+def _locked(method: _F) -> _F:
+    """The app feeds the tracker from its Bluetooth thread and reads it from the main thread."""
+
+    @wraps(method)
+    def inner(self: "DrinkTracker", *args: Any, **kwargs: Any) -> Any:
+        with self.lock:
+            return method(self, *args, **kwargs)
+
+    return inner  # type: ignore[return-value]
 
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "EmberMug"
 CAPTURE_PATH = SUPPORT_DIR / "stats-capture.jsonl"
@@ -326,6 +341,7 @@ class DrinkTracker:
 
     def __init__(self, drinks_path: Path = DRINKS_PATH, current_path: Path = CURRENT_PATH, daily_path: Path = DAILY_PATH, history_path: Path = HISTORY_PATH) -> None:
         self.drinks_path, self.current_path, self.daily_path, self.history_path = drinks_path, current_path, daily_path, history_path
+        self.lock = threading.RLock()
         self.reassembler = Reassembler()
         self.current: Optional[Drink] = None
         self.rows: list[dict[str, Any]] = self._load_rows()
@@ -352,6 +368,7 @@ class DrinkTracker:
             pass
         return rows
 
+    @_locked
     def load_history(self) -> list[dict[str, Any]]:
         """The app's readings from the last HISTORY_KEEP_S. history.jsonl only ever grows, and this runs on every
         packet and every menu refresh, so read it incrementally: only the bytes appended since the last call."""
@@ -387,6 +404,7 @@ class DrinkTracker:
         self.rows = [r for r in self.rows if r["id"] != row["id"]] + [row]
         write_atomic(self.drinks_path, "".join(json.dumps(r) + "\n" for r in self.rows))
 
+    @_locked
     def save_state(self) -> None:
         """Write the in-progress drink and the daily summary (cheap; called after every change)."""
         self.drinks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,6 +421,7 @@ class DrinkTracker:
         write_atomic(self.daily_path, json.dumps(self.daily_summary(history=history), indent=2))
 
     # ---- events from the app ----
+    @_locked
     def feed_packet(self, raw: bytes, arrived: float) -> list[Record]:
         self.arrivals = [t for t in self.arrivals if arrived - t <= 600] + [arrived]
         records = self.reassembler.feed(raw, arrived, False)
@@ -424,6 +443,7 @@ class DrinkTracker:
             self.current = Drink()
         self.current.add(r)
 
+    @_locked
     def mark_pour(self, ts: float) -> None:
         """The app saw the mug go Empty → Filling/Heating: the most trustworthy pour timestamp."""
         if self.current and self.current.records and self.current.ended_at is None:
@@ -438,12 +458,14 @@ class DrinkTracker:
         self.current.anchor_source = "app"
         self.save_state()
 
+    @_locked
     def mark_empty(self, ts: float) -> None:
         if self.current and (self.current.records or self.current.t0):
             self.finalize("emptied", ts)
             self.current = None
             self.save_state()
 
+    @_locked
     def finalize(self, reason: str, ended_at: Optional[float]) -> None:
         if not self.current or not (self.current.records or self.current.t0):
             return
@@ -454,6 +476,7 @@ class DrinkTracker:
         self._append_row(self.current.to_row(self.load_history()))
 
     # ---- summaries ----
+    @_locked
     def all_rows(self, history: Optional[list[dict[str, Any]]] = None) -> list[dict[str, Any]]:
         rows = list(self.rows)
         if self.current:
@@ -462,6 +485,7 @@ class DrinkTracker:
             rows.append(self.current.to_row(history if history is not None else self.load_history()))
         return sorted(rows, key=lambda r: r.get("poured_ts") or 0)
 
+    @_locked
     def daily_summary(self, day: Optional[datetime] = None, history: Optional[list[dict[str, Any]]] = None, rows: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
         day = day or datetime.now()
         start = day.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -516,6 +540,7 @@ class DrinkTracker:
             parts.append("one in progress")
         return " · ".join(parts)
 
+    @_locked
     def briefing(self, use_f: bool = True, rows: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
         """Yesterday and today, as data and as lines, for morning summaries and scripts."""
         rows = rows if rows is not None else self.all_rows()

@@ -162,6 +162,14 @@ macOS will ask once for Bluetooth access on behalf of Python. If you denied it: 
 **Logs**
 `~/Library/Logs/EmberMug/ember-mug.log` (also **Open Log** in the menu). The launcher's own output is in `launcher.log` next to it.
 
+## Tests
+
+The decoder and the app's GUI-free parts (config, CLI command queue, history) have unit tests that run anywhere, no Mac or mug needed:
+
+```bash
+python -m unittest discover -s tests
+```
+
 ## How it works
 
 `ember_mug_app.py` runs a [rumps](https://github.com/jaredks/rumps) menu bar app on the main thread and a BLE `asyncio` loop on a background thread. python-ember-mug handles the Ember GATT protocol, subscribes to the mug's push-event characteristic, and fires a callback when anything changes; the app marshals those updates onto the main thread and redraws the menu. `build_app.sh` wraps the script in a minimal `.app` whose launcher starts Python detached; the app hides itself from the Dock by setting the accessory activation policy in code. (Don't `exec` Python from the launcher: on recent macOS the status item then never draws.)
