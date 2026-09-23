@@ -18,9 +18,12 @@ Format reference: docs/statistics-stream.md. No GUI dependencies.
 from __future__ import annotations
 
 import argparse
+import bisect
 import html
 import json
+import os
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,6 +43,32 @@ NULL16 = 0x7FFF
 MUG_CAPACITY_ML = 414  # 14 oz Mug 2; level is 0-30
 CUP_MIN_LEVEL = 8  # below ~25 % full it was a rinse, not a drink
 KIND_NAMES = {0x05: "state change", 0x07: "target set by app", 0x0F: "heater engaged", 0x10: "10-min sample", 0x15: "snapshot"}
+BURST_WINDOW_S = 3  # packets this close together ...
+BURST_MIN_PACKETS = 4  # ... and at least this many of them: a backlog flush, not a live record
+HISTORY_KEEP_S = 2 * 86400  # app readings kept in memory for the drink in progress (finished drinks carry their own)
+
+
+def is_burst(sorted_arrivals: list[float], ts: float) -> bool:
+    """True if at least BURST_MIN_PACKETS packets (this one included) arrived within BURST_WINDOW_S of ts."""
+    lo = bisect.bisect_left(sorted_arrivals, ts - BURST_WINDOW_S)
+    hi = bisect.bisect_right(sorted_arrivals, ts + BURST_WINDOW_S)
+    return hi - lo >= BURST_MIN_PACKETS
+
+
+def write_atomic(path: Path, text: str) -> None:
+    """Write via a temp file and rename, so a reader (or a crash) never sees half a file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -145,15 +174,11 @@ class Reassembler:
 
 
 def reassemble_rows(rows: list[dict[str, Any]]) -> list[Record]:
-    arrivals = [r["ts"] for r in rows]
-
-    def is_burst(i: int) -> bool:
-        return sum(1 for ts in arrivals if abs(ts - arrivals[i]) <= 3) >= 4
-
+    arrivals = sorted(r["ts"] for r in rows)
     ra = Reassembler()
     out: list[Record] = []
-    for i, row in enumerate(rows):
-        out += ra.feed(bytes.fromhex(row["hex"].replace(" ", "")), row["ts"], is_burst(i))
+    for row in rows:
+        out += ra.feed(bytes.fromhex(row["hex"].replace(" ", "")), row["ts"], is_burst(arrivals, row["ts"]))
     return out
 
 
@@ -194,14 +219,14 @@ class Drink:
         Done lazily because the first packets of a flush look 'live' until the rest arrive."""
         if self.anchor_source == "app":
             return
+        arrivals = sorted(arrivals)
+        for r in self.records:
+            r.burst = is_burst(arrivals, r.arrived)
         if self.clock_base is not None:
             self.t0, self.anchor_source = float(self.clock_base), "clock"
-            for r in self.records:
-                r.burst = sum(1 for ts in arrivals if abs(ts - r.arrived) <= 3) >= 4
             return
         live: list[Record] = []
         for r in self.records:
-            r.burst = sum(1 for ts in arrivals if abs(ts - r.arrived) <= 3) >= 4
             if not r.burst and r.kind >= 0:
                 live.append(r)
         if live:
@@ -305,6 +330,9 @@ class DrinkTracker:
         self.current: Optional[Drink] = None
         self.rows: list[dict[str, Any]] = self._load_rows()
         self.arrivals: list[float] = []  # packet arrival times (recent), to tell a backlog flush from a live record
+        self._history: list[dict[str, Any]] = []
+        self._history_pos = 0
+        self._history_ino: Optional[int] = None
 
     # ---- persistence ----
     def _load_rows(self) -> list[dict[str, Any]]:
@@ -312,31 +340,52 @@ class DrinkTracker:
         try:
             with open(self.drinks_path) as f:
                 for line in f:
-                    if line.strip():
-                        rows.append(json.loads(line))
+                    if not line.strip():
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue  # a torn line (e.g. power loss mid-write) must not take the whole log down
+                    if isinstance(row, dict) and "id" in row:
+                        rows.append(row)
         except OSError:
             pass
         return rows
 
     def load_history(self) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
+        """The app's readings from the last HISTORY_KEEP_S. history.jsonl only ever grows, and this runs on every
+        packet and every menu refresh, so read it incrementally: only the bytes appended since the last call."""
         try:
-            with open(self.history_path) as f:
-                for line in f:
-                    try:
-                        out.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        continue
+            st = os.stat(self.history_path)
         except OSError:
-            pass
-        return out
+            self._history, self._history_pos, self._history_ino = [], 0, None
+            return []
+        if st.st_ino != self._history_ino or st.st_size < self._history_pos:  # replaced or truncated: start over
+            self._history, self._history_pos, self._history_ino = [], 0, st.st_ino
+        if st.st_size > self._history_pos:
+            try:
+                with open(self.history_path, "rb") as f:
+                    f.seek(self._history_pos)
+                    chunk = f.read()
+            except OSError:
+                return self._history
+            end = chunk.rfind(b"\n") + 1  # leave a half-written last line for next time
+            self._history_pos += end
+            for line in chunk[:end].splitlines():
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("ts"), (int, float)):
+                    self._history.append(row)
+        cutoff = datetime.now().timestamp() - HISTORY_KEEP_S
+        if self._history and self._history[0]["ts"] < cutoff:
+            self._history = [h for h in self._history if h["ts"] >= cutoff]
+        return self._history
 
     def _append_row(self, row: dict[str, Any]) -> None:
         self.rows = [r for r in self.rows if r["id"] != row["id"]] + [row]
-        self.drinks_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.drinks_path, "w") as f:
-            for r in self.rows:
-                f.write(json.dumps(r) + "\n")
+        write_atomic(self.drinks_path, "".join(json.dumps(r) + "\n" for r in self.rows))
 
     def save_state(self) -> None:
         """Write the in-progress drink and the daily summary (cheap; called after every change)."""
@@ -345,15 +394,13 @@ class DrinkTracker:
         if self.current:
             self.current.reanchor(self.arrivals)
         if self.current and (self.current.records or self.current.t0):
-            with open(self.current_path, "w") as f:
-                json.dump(self.current.to_row(history), f)
+            write_atomic(self.current_path, json.dumps(self.current.to_row(history)))
         else:
             try:
                 self.current_path.unlink()
             except OSError:
                 pass
-        with open(self.daily_path, "w") as f:
-            json.dump(self.daily_summary(history=history), f, indent=2)
+        write_atomic(self.daily_path, json.dumps(self.daily_summary(history=history), indent=2))
 
     # ---- events from the app ----
     def feed_packet(self, raw: bytes, arrived: float) -> list[Record]:
@@ -370,7 +417,8 @@ class DrinkTracker:
             return
         if self.current is None:
             self.current = Drink()
-        elif starts_new_drink(r, self.current.last_t):
+        elif self.current.records and starts_new_drink(r, self.current.last_t):
+            # (no records yet = the app just marked this pour itself; the mug's "filling" record belongs to it)
             # A backlog can carry several finished drinks; a live "filling" record means a fresh pour.
             self.finalize("next pour", None)
             self.current = Drink()
@@ -482,6 +530,23 @@ class DrinkTracker:
             "week_cups": len(week_rows),
             "week_ml": sum(r["consumed_ml"] or 0 for r in week_rows),
         }
+
+
+def read_history(path: Path = HISTORY_PATH) -> list[dict[str, Any]]:
+    """Every reading in history.jsonl (for rebuilding old drinks; the tracker itself only keeps recent ones)."""
+    out: list[dict[str, Any]] = []
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("ts"), (int, float)):
+                    out.append(row)
+    except OSError:
+        pass
+    return out
 
 
 def drinks_from_capture(rows: list[dict[str, Any]], history: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1025,7 +1090,7 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
 
     tracker = DrinkTracker()
-    history = tracker.load_history()
+    history = read_history() if args.from_capture else tracker.load_history()
     if args.from_capture:
         try:
             with open(args.capture) as f:
@@ -1069,7 +1134,7 @@ def main(argv: list[str]) -> int:
     if args.json:
         print(json.dumps({"daily": daily, "drinks": [{k: v for k, v in r.items() if k not in ('records', 'app_temps', 'app_levels')} for r in rows]}, indent=2, default=str))
         return 0
-    print(tracker.today_line(use_f=not args.celsius))
+    print(tracker.day_line(daily, "Today", use_f=not args.celsius))
     for r in rows:
         print(f"  {r['poured_at'] or r['id']:>20}  {fmt_dur(r['duration_s']):>8}  level {r['start_level']}→{r['end_level']}  {r['consumed_ml'] or '—'} ml  ready {fmt_dur(r['reached_target_after_s'])}  {'cup' if r['is_cup'] else 'rinse'}{' · in progress' if r['in_progress'] else ''}")
     return 0
